@@ -172,7 +172,8 @@ def scope_autoset() -> str:
     return "autoset issued"
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # return shape varies (dict, or [dict, Image]
+                                    # when plot=True) — no fixed output schema
 def scope_grab(channel: int = 1, span_ms: float = 3.0,
                points: int = 100000, save_npz: str | None = None,
                plot: bool = False) -> dict | list:
@@ -289,7 +290,7 @@ def scope_trigger(channel: int = 1, slope: str | None = None,
                       mode=mode, ttype=type)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return [dict, Image] when plot=True
 def scope_single(channel: int = 1, span_ms: float = 3.0, points: int = 100000,
                  timeout: float = 30.0, save_npz: str | None = None,
                  plot: bool = False) -> dict | list:
@@ -330,7 +331,7 @@ def scope_single(channel: int = 1, span_ms: float = 3.0, points: int = 100000,
     return out
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return [dict, Image] when plot=True
 def scope_capture(channel: int = 1, vdiv: float | None = None,
                   ofst: float | None = None, tdiv: str | None = None,
                   trdl: str | None = None, cpl: str | None = None,
@@ -400,7 +401,7 @@ def scope_capture(channel: int = 1, vdiv: float | None = None,
     return out
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return [dict, Image] when plot=True
 def scope_math(span_ms: float = 3.0, points: int = 100000,
                define: str | None = None, save_npz: str | None = None,
                plot: bool = False) -> dict | list:
