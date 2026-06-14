@@ -1,0 +1,231 @@
+#+TITLE: Siglent SDS1202X-E — Remote Control over LAN
+#+DATE: 2026-06-13
+#+OPTIONS: toc:2
+
+Everything in this document was verified live on the bench on
+2026-06-12/13 against the actual instrument (s/n XXXXXXXXXXXXXX,
+firmware 1.3.28). Where the programming guide and reality disagreed,
+reality won; those cases are flagged as *gotchas*.
+
+* The instrument and how to reach it
+
+| Item       | Value                                              |
+|------------+----------------------------------------------------|
+| Model      | Siglent SDS1202X-E, 200 MHz, 2 ch, 1 GSa/s         |
+| Serial     | XXXXXXXXXXXXXX                                     |
+| Firmware   | 1.3.28 (1.3.27/28 fixed several SCPI bugs)         |
+| IP         | 192.168.1.139 (DHCP)                               |
+| MAC        | 00:14:A2:XX:XX:XX (Siglent OUI 00:14:A2)           |
+| Protocol   | raw TCP ("socket") port 5025, newline-terminated   |
+| Path       | scope LAN port -> yellow CAT-5e -> AirPort Extreme |
+
+If the IP changed (new DHCP lease), find it by MAC:
+ping-sweep the subnet, then =ip neigh | rg -i 00:14:a2=.
+
+Quick liveness test:
+#+begin_src sh
+printf '*IDN?\n' | timeout 3 nc 192.168.1.139 5025
+# Siglent Technologies,SDS1202X-E,XXXXXXXXXXXXXX,1.3.28
+#+end_src
+
+Minimal Python session (the pattern all bench scripts use):
+#+begin_src python
+import socket
+s = socket.create_connection(("192.168.1.139", 5025), timeout=10)
+f = s.makefile("rb")
+def cmd(t): s.sendall(t.encode() + b"\n")          # no reply expected
+def query(t):
+    cmd(t)
+    return f.readline().decode("ascii", "replace").strip()
+cmd("CHDR OFF")                                     # do this FIRST, see below
+print(query("*IDN?"))
+#+end_src
+
+* First command of every session: CHDR OFF
+
+=CHDR OFF= suppresses echo headers and units in query replies:
+=C2:VDIV 1.00E+00V= becomes =1.00E+00=. Without it every reply needs
+unit-stripping, and a stray V/% suffix in a float parse was a real bug
+source. PAVA replies still carry a =DUTY,= style prefix — parse with
+=reply.split(",")[-1]=.
+
+* Everyday control
+
+| Task                | Command                  | Notes                          |
+|---------------------+--------------------------+--------------------------------|
+| auto setup          | =ASET=                   | as good as the front button    |
+| show/hide channel   | =C1:TRA ON= / =OFF=      |                                |
+| vertical scale      | =C1:VDIV 1V=             | 500uV..10V                     |
+| vertical offset     | =C1:OFST -2.5V=          | see position formula below     |
+| probe factor        | =C1:ATTN 1= / =10=       | MUST match the probe slider!   |
+| coupling            | =C1:CPL D1M=             | DC 1 Mohm                      |
+| timebase            | =TDIV 200US=             |                                |
+| trigger select      | =TRSE EDGE,SR,C2,HT,OFF= | source C2, no holdoff          |
+| trigger level       | =C2:TRLV 2.5V=           | absolute volts                 |
+| trigger slope       | =C2:TRSL POS=            |                                |
+| trigger mode        | =TRMD AUTO=              | AUTO / NORM / SINGLE / STOP    |
+| acquisition         | =ARM= / =STOP=           |                                |
+
+Trace position on screen, in divisions from center:
+=position = (V_signal + OFST) / VDIV=, visible range about +-4 div.
+Example: a 0-5 V square at VDIV 2V, OFST -6V sits between -3 and
+-0.5 div (lower half). At VDIV 2V, OFST +1V it sits between +0.5 and
++3 div (upper half). That pair puts two 0-5 V signals on screen
+without overlap.
+
+* Measurements (PAVA)
+
+#+begin_src text
+C1:PAVA? MEAN | PKPK | FREQ | DUTY | MAX | MIN | RMS | PER | ...
+C1:PAVA? ALL        # everything at once
+#+end_src
+
+- Replies look like =DUTY,7.491000E+01= (with CHDR OFF).
+- An unmeasurable value reads =****= — guard the float() call.
+- DUTY is the *positive* duty (high time / period). The IOB4 PWM pins
+  are ULN-inverted, so scope DUTY = 100 - firmware duty.
+- FREQ needs a stable trigger; without one it reads =****= or garbage
+  while PKPK/MEAN still read fine. Don't gate automation on FREQ alone.
+
+* Screenshots (SCDP)
+
+Send =SCDP=, then read exactly 768066 bytes (800x480 24-bit BMP; the
+size is also in BMP header bytes 2..5). Read with recv() in a loop —
+the data contains 0x0A bytes, so line-based reads truncate.
+
+#+begin_src python
+cmd("SCDP")
+data = b""
+while len(data) < 768066:
+    chunk = s.recv(65536)
+    if not chunk: break
+    data += chunk
+open("shot.bmp", "wb").write(data)
+# ffmpeg -i shot.bmp shot.png
+#+end_src
+
+* Raw waveform readout — the good stuff
+
+This bypasses the display entirely: actual sample memory, immune to
+whatever the knobs are set to. Used to render pwm_both_waveforms.png.
+
+#+begin_src python
+vdiv = float(query("C2:VDIV?"))
+ofst = float(query("C2:OFST?"))
+sara = float(query("SARA?").split(",")[-1].rstrip("Sa/s"))  # sample rate
+
+span_s, npts = 0.003, 100000          # 3 ms window, 100k points
+sp = max(1, int(sara * span_s / npts))  # sparsing: keep every sp-th sample
+cmd(f"WFSU SP,{sp},NP,{npts},FP,0")
+cmd("C2:WF? DAT2")
+#+end_src
+
+The reply is =C2:WF DAT2,#9<9-digit-length><binary>= followed by two
+terminator bytes. Parse the =#9= IEEE block, then:
+
+#+begin_src python
+import numpy as np
+codes = np.frombuffer(payload, dtype=np.int8).astype(float)
+volts = codes * (vdiv / 25.0) - ofst         # Siglent's formula
+t     = np.arange(len(volts)) * sp / sara    # seconds
+#+end_src
+
+Notes:
+- int8 codes, 25 codes per division, OFST *subtracts*.
+- Binary contains 0x0A/0x0D — raw recv() only, never readline().
+- 100k points over 3 ms was instant; full 14 Mpt memory works but is
+  slow — always set NP.
+
+* Reference traces (REF)
+
+Supported remotely on the X-E (handy for one-probe comparisons:
+freeze channel A, move the probe, live trace + frozen copy together):
+
+#+begin_src text
+REFSR C2      # source
+REFLA REFA    # slot A..D
+REFDS ON      # display reference
+REFSA         # save source -> current slot, shows on screen
+REFSC 2V      # scale of the ref trace
+REFPO 2V      # position of the ref trace
+REFCL         # close the whole REF function
+#+end_src
+
+*Gotcha:* =REFSC?= / =REFPO?= replies are garbage on fw 1.3.28
+(E-12 exponents). Set values blind; don't read them back.
+The saved trace survives a power cycle.
+
+* Gotchas collected the hard way
+
+- *ATTN vs the probe slider.* =C1:ATTN= only tells the scope what to
+  multiply by. If the probe's physical 1X/10X slider disagrees, every
+  reading is 10x off. After any probe change, verify on the 1 kHz cal
+  tab (3 Vpp square, mean 1.5 V).
+- *A broken probe can look like a working setup.* One PP215 passed
+  only a capacitively-coupled ghost: correct shape, correct duty,
+  ~1000x attenuated (5 mV instead of 5 V), and it intermittently read
+  the cal tab fine. Hours went into chasing imaginary board faults.
+  Rule: shape-correct but mV-scale signal => suspect the probe; test
+  by putting both probe tips on the same point, or swap BNCs at the
+  scope and see whether the fault follows the cable.
+- *Front panel and SCPI race.* Commands take effect, then a hand on a
+  knob silently undoes them. Don't fight it: read back state before
+  trusting it, or agree on who's driving.
+- *Means lie when the trace clips.* If part of the waveform is off
+  screen, PAVA MEAN/PKPK are computed on the clipped data. Set
+  VDIV/OFST so the whole signal is on screen (or pull raw samples).
+- *Default/factory reset* reverts probe ratio to 1X and may disable
+  DHCP (shipped static was 10.11.13.220). If the scope vanishes from
+  the LAN after a reset, check Utility -> I/O -> IP Set.
+- *One client at a time.* Parallel sockets confuse it; keep a single
+  connection per script and close it.
+
+* Automation patterns that worked
+
+- *Watch loop:* poll =PAVA? PKPK/MEAN= every 1-2 s; announce state
+  changes via Piper TTS so the operator hears progress with hands on
+  the probes. Require N consecutive good samples before acting —
+  single-sample triggers fire on noise (an open input idles at
+  ~0.3-0.9 Vpp of mains pickup, right where a 10X-attenuated signal
+  would land).
+- *Acceptance criteria:* a real 0-5 V square here is pkpk > 3 V at
+  ~1 kHz with a sane DUTY; check pkpk and duty, treat FREQ as advisory.
+- *Driving DUT + instrument together:* one script holding both the
+  serial console (/dev/ttyUSB1, 38400) and the scope socket can step
+  the firmware (e.g. =1,50= duty commands) and measure each step with
+  a settle delay — that's the whole PWM staircase verification in
+  ~30 lines.
+
+* scope.py — the bench tool
+
+All of the above is wrapped in =scope.py= (repo root), built on
+*PyVISA* with the pure-Python =pyvisa-py= backend (installed in
+~/PY3). Library use: =from scope import Scope=. CLI:
+
+#+begin_src sh
+./scope.py idn
+./scope.py meas C1 all                # or: meas C2 PKPK DUTY
+./scope.py q "C1:VDIV?"               # raw query
+./scope.py c "TDIV 200US" "C1:TRA ON" # raw commands
+./scope.py shot /tmp/screen.png
+./scope.py grab C1 --span-ms 3 --out d.npz --plot d.png
+./scope.py watch C1 PKPK ">3" --timeout 120 --say "contact"
+./scope.py split C1 C2                # two 0-5V traces, no overlap
+#+end_src
+
+=watch= debounces (3 consecutive samples) and can speak via Piper —
+the hands-on-probes workflow. =grab= prints min/max/high% and exits
+nonzero on failure, so it composes in shell scripts.
+
+The default transport is the LAN socket resource
+=TCPIP0::192.168.1.139::5025::SOCKET=; pass =--resource= with a VISA
+USB-TMC string to bypass the LAN, and any future instrument (PSU,
+DMM) can reuse the same PyVISA stack.
+
+* References
+
+- Programming guide: "Digital Oscilloscope Series Programming Guide"
+  EN02E, int.siglent.com (336 p). Covers many models — this scope
+  ignores C3/C4 and some commands; the per-command "Valid?" tables
+  matter.
+- User manual: SDS1000X-E series, int.siglent.com.
